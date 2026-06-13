@@ -2,13 +2,13 @@
 set -euo pipefail
 
 # ============================================================
-# 自动探测 pipeline: dataset 模式 / YOLO 模式 → SAM3 → Judge → Report
+# 自动探测 pipeline v2: dataset/YOLO → SAM3 → Judge → Report → 失败图片再优化
+#
+# v2 新增: Step 4 — 对 fail/review 图片用 Qwen 分析 YOLO box 内容,
+#          SAM3 混合提示 (box+text) 重分割, 重新 judge, 合并真值
 #
 # 用法:
-#   bash run_pipeline.sh <input_dir> [output_dir]
-#
-#   input_dir:  如 /root/piplinetest/辣椒包堆叠/
-#   output_dir: 可选, 默认 {input_dir}/pipeline_output/
+#   bash run_pipeline_02.sh <input_dir> [output_dir]
 #
 # 可选环境变量:
 #   SAM3_CHECKPOINT      SAM3 模型权重 (默认 /home/model/sam3_pth/sam3pt/sam3.pt)
@@ -18,9 +18,10 @@ set -euo pipefail
 #   SAM3_CONDA_ENV        SAM3 conda 环境名 (默认 sam3_6000d)
 #   JUDGE_CONDA_ENV       judge conda 环境名 (默认 vllm_new)
 #   GPU_DEVICE            指定 GPU 卡号 (如 0 或 1), 不设则使用全部 GPU
+#   SKIP_RERUN            设为 1 跳过 Step 4 再优化 (默认 0 = 执行)
 # ============================================================
 
-INPUT_DIR="${1:?用法: bash run_pipeline.sh <input_dir> [output_dir]}"
+INPUT_DIR="${1:?用法: bash run_pipeline_02.sh <input_dir> [output_dir]}"
 
 INPUT_DIR="${INPUT_DIR%/}"
 FOLDER_NAME="$(basename "$INPUT_DIR")"
@@ -35,8 +36,9 @@ JUDGE_PASS_THRESHOLD="${JUDGE_PASS_THRESHOLD:-0.75}"
 SAM3_CONDA_ENV="${SAM3_CONDA_ENV:-sam3_6000d}"
 JUDGE_CONDA_ENV="${JUDGE_CONDA_ENV:-vllm_new}"
 GPU_DEVICE="${GPU_DEVICE:-}"
+SKIP_RERUN="${SKIP_RERUN:-0}"
 
-# ---- GPU 绑定: 所有 Python 子进程仅可见指定 GPU ----
+# ---- GPU 绑定 ----
 if [ -n "$GPU_DEVICE" ]; then
     export CUDA_VISIBLE_DEVICES="$GPU_DEVICE"
 fi
@@ -48,7 +50,6 @@ if [ -d "${INPUT_DIR}/dataset" ]; then
     JUDGE_IMAGE_DIR="${INPUT_DIR}/dataset"
 else
     MODE="yolo"
-    # 找 .pt 文件: 优先 best.pt, 否则只用唯一的 .pt, >1 个且无 best.pt 则跳过
     PT_FILES=()
     PT_FOUND=""
     while IFS= read -r -d '' f; do
@@ -60,7 +61,6 @@ else
         exit 1
     fi
 
-    # 统计 best.pt 数量（只允许 1 个，多个 best.pt 无法确定用哪个→跳过）
     BEST_PT_COUNT=0
     BEST_PT=""
     for f in "${PT_FILES[@]}"; do
@@ -73,13 +73,13 @@ else
     if [ "$BEST_PT_COUNT" -eq 1 ]; then
         PT_FOUND="$BEST_PT"
     elif [ "$BEST_PT_COUNT" -gt 1 ]; then
-        echo "[ERROR] 发现 ${BEST_PT_COUNT} 个 best.pt 文件，无法确定用哪个，跳过此文件夹"
+        echo "[ERROR] 发现 ${BEST_PT_COUNT} 个 best.pt 文件"
         for f in "${PT_FILES[@]}"; do echo "  $f"; done
         exit 1
     elif [ "${#PT_FILES[@]}" -eq 1 ]; then
         PT_FOUND="${PT_FILES[0]}"
     else
-        echo "[ERROR] 发现 ${#PT_FILES[@]} 个 .pt 文件且无 best.pt，跳过此文件夹"
+        echo "[ERROR] 发现 ${#PT_FILES[@]} 个 .pt 文件且无 best.pt"
         for f in "${PT_FILES[@]}"; do echo "  $f"; done
         exit 1
     fi
@@ -90,7 +90,7 @@ SAM3_OUT_DIR="${OUTPUT_DIR}/sam3_output"
 JUDGE_OUT_DIR="${OUTPUT_DIR}/judge_output"
 
 echo "============================================================"
-echo "  Pipeline: ${FOLDER_NAME}"
+echo "  Pipeline v2: ${FOLDER_NAME}"
 echo "  Mode:       ${MODE}"
 echo "  Input:      ${INPUT_DIR}"
 echo "  Output:     ${OUTPUT_DIR}"
@@ -104,19 +104,18 @@ eval "$(conda shell.bash hook)"
 
 # ---- Step 1: SAM3 推理 ----
 echo ""
-echo "[Step 1/3] SAM3 推理 (${MODE} 模式)..."
+echo "[Step 1/4] SAM3 推理 (${MODE} 模式)..."
 conda activate "$SAM3_CONDA_ENV"
 
 mkdir -p "$SAM3_OUT_DIR"
 
 if [ "$MODE" = "dataset" ]; then
-    python /home/model/work/sam3_facebook/batch.py \
+    python /home/model/work/sam3_facebook/batch_01.py \
         --dataset-root "$INPUT_DIR" \
         --splits $SPLITS \
         --output-dir "$SAM3_OUT_DIR" \
         --checkpoint "$SAM3_CHECKPOINT"
 
-    # 合并 train/valid/test 的 COCO JSON → instances_default.json
     MERGED_DIR="${SAM3_OUT_DIR}/${FOLDER_NAME}/Instance"
     mkdir -p "$MERGED_DIR"
 
@@ -156,7 +155,7 @@ print(f'合并完成: {out} ({len(merged[\"images\"])} images, {len(merged[\"ann
 
     COCO_JSON="${MERGED_DIR}/instances_default.json"
 else
-    python /home/model/work/sam3_facebook/batch.py \
+    python /home/model/work/sam3_facebook/batch_01.py \
         --dataset-root "$INPUT_DIR" \
         --output-dir "$SAM3_OUT_DIR" \
         --checkpoint "$SAM3_CHECKPOINT"
@@ -168,11 +167,11 @@ if [ ! -f "$COCO_JSON" ]; then
     echo "[ERROR] SAM3 未生成 COCO JSON: $COCO_JSON"
     exit 1
 fi
-echo "[Step 1/3] 完成: $COCO_JSON"
+echo "[Step 1/4] 完成: $COCO_JSON"
 
 # ---- Step 2: Qwen-VL 质检 ----
 echo ""
-echo "[Step 2/3] Qwen-VL 质检..."
+echo "[Step 2/4] Qwen-VL 质检..."
 conda activate "$JUDGE_CONDA_ENV"
 
 if [ "$MODE" = "yolo" ]; then
@@ -182,7 +181,7 @@ if [ "$MODE" = "yolo" ]; then
     fi
 fi
 
-python /home/model/work/llm/judge.py \
+python /home/model/work/llm/judge_01.py \
     --images-dir "$JUDGE_IMAGE_DIR" \
     --coco-json "$COCO_JSON" \
     --output-dir "$JUDGE_OUT_DIR" \
@@ -195,16 +194,43 @@ if [ ! -f "$JUDGE_REPORT" ]; then
     echo "[ERROR] judge 未生成报告: $JUDGE_REPORT"
     exit 1
 fi
-echo "[Step 2/3] 完成: $JUDGE_REPORT"
+echo "[Step 2/4] 完成: $JUDGE_REPORT"
 
 # ---- Step 3: 结果汇总 ----
 echo ""
-echo "[Step 3/3] 结果汇总..."
-python /home/model/work/llm/check_report.py "$JUDGE_REPORT"
+echo "[Step 3/4] 结果汇总..."
+python /home/model/work/llm/check_report_01.py "$JUDGE_REPORT"
+
+# ---- Step 4: 失败图片再优化 (Qwen描述 + SAM3混合提示 + 重新评判 + COCO合并) ----
+if [ "$SKIP_RERUN" = "1" ]; then
+    echo ""
+    echo "[Step 4/4] SKIP (SKIP_RERUN=1)"
+else
+    echo ""
+    echo "[Step 4/4] 失败图片再优化..."
+    # 确保在 vllm_new 环境中运行 (Qwen 模型)
+    conda activate "$JUDGE_CONDA_ENV"
+
+    python /home/model/work/llm/rerun_optimize.py \
+        --judge-report "$JUDGE_REPORT" \
+        --coco-json "$COCO_JSON" \
+        --images-dir "$JUDGE_IMAGE_DIR" \
+        --output-dir "$OUTPUT_DIR" \
+        --model-path "$JUDGE_MODEL_PATH" \
+        --sam3-checkpoint "$SAM3_CHECKPOINT" \
+        --sam3-conda-env "$SAM3_CONDA_ENV" \
+        --pass-threshold "$JUDGE_PASS_THRESHOLD"
+
+    echo "[Step 4/4] 再优化完成"
+    echo "  全量真值: ${OUTPUT_DIR}/rerun/instances_all.json"
+    echo "  仅通过真值: ${OUTPUT_DIR}/rerun/instances_pass_only.json"
+    echo "  重跑报告: ${OUTPUT_DIR}/rerun/rerun_report.json"
+fi
 
 echo ""
 echo "============================================================"
-echo "  Pipeline 完成: ${FOLDER_NAME}"
+echo "  Pipeline v2 完成: ${FOLDER_NAME}"
 echo "  SAM3 output:  ${SAM3_OUT_DIR}"
 echo "  Judge output: ${JUDGE_OUT_DIR}"
+echo "  Rerun output: ${OUTPUT_DIR}/rerun/"
 echo "============================================================"
