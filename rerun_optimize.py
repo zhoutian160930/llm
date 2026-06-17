@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from collections import defaultdict
@@ -492,6 +493,97 @@ def merge_coco_jsons(original_coco, rerun_coco, image_paths_passed_rerun):
     return coco_all, coco_pass
 
 
+# ============ Helper: Copy + Merge ============
+
+def copy_dir_contents(src_dir, dst_dir):
+    """Copy all files from src_dir into dst_dir (overwrite)."""
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    if src_dir.exists():
+        for f in src_dir.iterdir():
+            shutil.copy2(str(f), str(dst_dir / f.name))
+
+
+def merge_judge_reports(original_report, rerun_report):
+    """Replace entries in original report with rerun results for matching file_names."""
+    rerun_by_file = {img["file_name"]: img for img in rerun_report.get("images", [])}
+
+    updated_images = []
+    pass_count = review_count = fail_count = 0
+    total_score = 0.0
+
+    for img in original_report.get("images", []):
+        fname = img["file_name"]
+        if fname in rerun_by_file:
+            rerun_img = rerun_by_file[fname]
+            img = dict(img)  # shallow copy
+            img["overall_status"] = rerun_img["overall_status"]
+            img["overall_score"] = rerun_img["overall_score"]
+            img["num_items"] = rerun_img.get("num_items", img.get("num_items", 0))
+
+        updated_images.append(img)
+        total_score += img.get("overall_score", 0)
+        status = img.get("overall_status", "review")
+        if status == "pass":
+            pass_count += 1
+        elif status == "fail":
+            fail_count += 1
+        else:
+            review_count += 1
+
+    n = len(updated_images)
+    original_report["images"] = updated_images
+    original_report["summary"]["pass"] = pass_count
+    original_report["summary"]["review"] = review_count
+    original_report["summary"]["fail"] = fail_count
+    original_report["summary"]["mean_overall_score"] = round(total_score / n, 4) if n > 0 else 0.0
+
+    return original_report
+
+
+def write_summary_txt(output_dir, failed_images, rerun_results, sam3_coco_path, judge_report_path):
+    """Write rerun_summary.txt — which images re-run, which passed, where saved."""
+    lines = []
+    lines.append("Rerun Summary")
+    lines.append("=" * 60)
+    lines.append(f"Total images re-run: {len(rerun_results)}")
+
+    pass_after = sum(1 for v in rerun_results.values() if v["status"] == "pass")
+    still_fail = len(rerun_results) - pass_after
+    lines.append(f"Pass after re-run: {pass_after}")
+    lines.append(f"Still fail/review: {still_fail}")
+    lines.append("")
+    lines.append("Re-run image details:")
+    lines.append("-" * 60)
+
+    for img_info in failed_images:
+        fname = img_info["file_name"]
+        rr = rerun_results.get(fname)
+        if rr:
+            orig_status = img_info.get("overall_status", "?")
+            new_status = rr["status"]
+            score = rr["score"]
+            lines.append(f"  {fname}: {orig_status} -> {new_status} (score: {score:.4f})")
+
+    lines.append("")
+    lines.append("-" * 60)
+    lines.append("Output locations:")
+    lines.append(f"  SAM3 merged COCO: {sam3_coco_path}")
+    lines.append(f"  Judge report:     {judge_report_path}")
+
+    # Pass-only image list
+    lines.append("")
+    lines.append("Pass images after re-run:")
+    for img_info in failed_images:
+        fname = img_info["file_name"]
+        rr = rerun_results.get(fname)
+        if rr and rr["status"] == "pass":
+            lines.append(f"  [RE-RUN PASS] {fname}")
+
+    txt_path = output_dir / "rerun_summary.txt"
+    txt_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"\n[INFO] Summary written to: {txt_path}")
+
+
 # ============ Main Orchestrator ============
 
 def parse_args():
@@ -525,10 +617,13 @@ def main():
     args = parse_args()
 
     output_dir = Path(args.output_dir)
-    rerun_dir = output_dir / "rerun"
-    rerun_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = output_dir / ".rerun_tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- 1. 读取 judge report, 找 fail+review 图片 ----
+    sam3_instance_dir = args.coco_json.parent
+    judge_output_dir = args.judge_report.parent
+
+    # ---- 1. Read judge report, find fail+review images ----
     with open(args.judge_report, 'r') as f:
         report = json.load(f)
 
@@ -536,34 +631,27 @@ def main():
                      if img.get("overall_status") in ("fail", "review")]
 
     if not failed_images:
-        print("[INFO] 没有 fail/review 的图片，无需重跑")
-        # Still create pass-only COCO
-        coco = load_coco_fn(args.coco_json)
-        pass_path = rerun_dir / "instances_pass_only.json"
-        all_path = rerun_dir / "instances_all.json"
-        pass_path.write_text(json.dumps(coco, indent=2, ensure_ascii=False), encoding="utf-8")
-        all_path.write_text(json.dumps(coco, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(f"[DONE] {pass_path}\n[DONE] {all_path}")
+        print("[INFO] No fail/review images to rerun")
+        failed_names = []
+        rerun_results = {}
+        write_summary_txt(output_dir, [], rerun_results, args.coco_json, args.judge_report)
         return
 
     if args.max_images > 0:
         failed_images = failed_images[:args.max_images]
 
-    print(f"[INFO] 找到 {len(failed_images)} 张 fail/review 图片")
+    print(f"[INFO] Found {len(failed_images)} fail/review images")
 
-    # Load COCO for bbox retrieval
     coco_data = load_coco_fn(args.coco_json)
-    coco_images = {img["id"]: img for img in coco_data.get("images", [])}
     coco_anns_by_img = defaultdict(list)
     for ann in coco_data.get("annotations", []):
         coco_anns_by_img[int(ann["image_id"])].append(ann)
-    # Map file_name → image_id
     file_to_id = {img["file_name"]: img["id"] for img in coco_data.get("images", [])}
 
-    # ---- 2. 加载 Qwen 模型 ----
+    # ---- 2. Load Qwen for global description ----
     gpu_count = torch.cuda.device_count()
     tensor_parallel_size = min(1, gpu_count)
-    print(f"[INFO] 加载 Qwen 模型: {args.model_path} (GPU count: {gpu_count})")
+    print(f"[INFO] Loading Qwen model: {args.model_path} (GPU count: {gpu_count})")
 
     processor = AutoProcessor.from_pretrained(args.model_path)
     llm = LLM(
@@ -580,14 +668,13 @@ def main():
     )
     sampling_params = SamplingParams(temperature=0, max_tokens=256, top_k=-1, stop_token_ids=[])
 
-    # ---- 3. 全局生成一次文本描述, 所有失败图片共用, 避免逐图调用 Qwen ----
+    # ---- 3. Global text description (one Qwen call for all failed images) ----
     prompt_input = {"images": []}
-    tmp_dir = rerun_dir / ".crops"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
+    crop_dir = tmp_dir / "crops"
+    crop_dir.mkdir(parents=True, exist_ok=True)
 
     global_text_desc = "object"
     if not args.skip_describe:
-        # 取第一张失败图片的第一个 bbox 区域, 调一次 Qwen 得到全局描述
         first_img_info = failed_images[0]
         first_file = first_img_info["file_name"]
         first_iid = file_to_id.get(first_file)
@@ -607,7 +694,7 @@ def main():
                     x2 = min(w, int(fx + fbw + margin_x))
                     y2 = min(h, int(fy + fbh + margin_y))
                     crop = pil_img.crop((x1, y1, x2, y2))
-                    crop_path = tmp_dir / f"{first_file.rsplit('.',1)[0]}_ref.jpg"
+                    crop_path = crop_dir / f"{first_file.rsplit('.',1)[0]}_ref.jpg"
                     crop.save(str(crop_path), quality=92)
                     try:
                         global_text_desc = qwen_describe_object(llm, processor, sampling_params, str(crop_path))
@@ -617,6 +704,7 @@ def main():
                 except Exception as e:
                     print(f"    [WARN] Cannot generate global desc: {e}")
 
+    # ---- 4. Build SAM3 prompts ----
     for img_info in tqdm(failed_images, desc="Building prompts"):
         file_name = img_info["file_name"]
         image_id = file_to_id.get(file_name)
@@ -658,35 +746,33 @@ def main():
         print("[ERROR] No valid images with prompts generated")
         sys.exit(1)
 
-    # Save prompt JSON for SAM3
-    prompt_json_path = rerun_dir / "sam3_prompts.json"
+    prompt_json_path = tmp_dir / "sam3_prompts.json"
     prompt_json_path.write_text(json.dumps(prompt_input, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"[INFO] Saved {len(prompt_input['images'])} images with prompts to {prompt_json_path}")
 
-    # ---- 释放 Qwen 模型显存，给 SAM3 腾空间 ----
-    print(f"\n[INFO] 释放 Qwen 模型显存...")
+    # Release Qwen GPU memory for SAM3
+    print(f"\n[INFO] Releasing Qwen GPU memory...")
     del llm
     del processor
     import gc
     gc.collect()
     torch.cuda.empty_cache()
-    print(f"[INFO] GPU memory freed: {torch.cuda.memory_allocated(0)/1024**3:.1f} GB allocated, "
-          f"{torch.cuda.memory_reserved(0)/1024**3:.1f} GB reserved")
+    print(f"[INFO] GPU memory freed: {torch.cuda.memory_allocated(0)/1024**3:.1f} GB allocated")
 
-    # ---- 4. 调用 SAM3 混合提示重分割 ----
-    sam3_output_dir = rerun_dir / "sam3_rerun_output"
-    sam3_output_dir.mkdir(parents=True, exist_ok=True)
+    # ---- 5. Run SAM3 mixed-prompt re-segmentation ----
+    sam3_tmp_dir = tmp_dir / "sam3_rerun_output"
+    sam3_tmp_dir.mkdir(parents=True, exist_ok=True)
 
     sam3_rerun_script = "/home/model/work/sam3_facebook/sam3_mixed_rerun.py"
-    print(f"\n[INFO] 调用 SAM3 混合提示重分割...")
-    print(f"  输入: {prompt_json_path}")
-    print(f"  输出: {sam3_output_dir}")
+    print(f"\n[INFO] Running SAM3 mixed-prompt re-segmentation...")
+    print(f"  Input:  {prompt_json_path}")
+    print(f"  Output: {sam3_tmp_dir}")
 
     cmd = [
         "conda", "run", "-n", args.sam3_conda_env, "--no-capture-output",
         "python", sam3_rerun_script,
         "--input-json", str(prompt_json_path),
-        "--output-dir", str(sam3_output_dir),
+        "--output-dir", str(sam3_tmp_dir),
         "--checkpoint", args.sam3_checkpoint,
         "--batch-size", "1",
     ]
@@ -695,27 +781,40 @@ def main():
         print(f"[ERROR] SAM3 rerun failed with exit code {result.returncode}")
         sys.exit(1)
 
-    rerun_coco_path = sam3_output_dir / "instances_default.json"
+    rerun_coco_path = sam3_tmp_dir / "instances_default.json"
     if not rerun_coco_path.exists():
         print(f"[ERROR] SAM3 rerun did not produce {rerun_coco_path}")
         sys.exit(1)
 
     print(f"[INFO] SAM3 rerun complete: {rerun_coco_path}")
 
-    # ---- 5. 重新 judge (直接调用 judge_01.py, 保证格式完全一致) ----
-    rerun_judge_dir = rerun_dir / "judge_output"
-    rerun_judge_dir.mkdir(parents=True, exist_ok=True)
+    # ---- 6. Copy SAM3 per-image outputs into original sam3_output ----
+    sam3_tmp_instance = sam3_tmp_dir / "Instance"
+    print(f"\n[INFO] Copying SAM3 rerun outputs into {sam3_instance_dir} ...")
+    for sub in ["label", "mask", "vis"]:
+        src = sam3_tmp_instance / sub
+        dst = sam3_instance_dir / sub
+        if src.exists():
+            n = sum(1 for _ in src.iterdir())
+            copy_dir_contents(src, dst)
+            print(f"  Copied {n} files: {sub}/")
 
-    print(f"\n[INFO] 重新 judge (调用 judge_01.py)...")
-    print(f"  COCO:    {rerun_coco_path}")
-    print(f"  Images:  {args.images_dir}")
-    print(f"  Output:  {rerun_judge_dir}")
+    # ---- 7. Merge COCO → overwrite original instances_default.json ----
+    print(f"\n[INFO] Merging COCO → overwriting {args.coco_json} ...")
+    coco_all, _ = merge_coco_jsons(args.coco_json, rerun_coco_path, set())
+    args.coco_json.write_text(json.dumps(coco_all, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"  Done: {len(coco_all['images'])} images, {len(coco_all['annotations'])} annotations")
 
+    # ---- 8. Re-judge rerun images ----
+    judge_tmp_dir = tmp_dir / "judge_output"
+    judge_tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n[INFO] Re-judging rerun images (calling judge_01.py)...")
     judge_cmd = [
         "python", "/home/model/work/llm/judge_01.py",
         "--images-dir", str(args.images_dir),
         "--coco-json", str(rerun_coco_path),
-        "--output-dir", str(rerun_judge_dir),
+        "--output-dir", str(judge_tmp_dir),
         "--model-path", args.model_path,
         "--pass-threshold", str(args.pass_threshold),
         "--max-images", "0",
@@ -725,72 +824,48 @@ def main():
         print(f"[ERROR] Re-judge failed with exit code {result.returncode}")
         sys.exit(1)
 
-    rerun_judge_report_path = rerun_judge_dir / "judge_report.json"
+    rerun_judge_report_path = judge_tmp_dir / "judge_report.json"
     if not rerun_judge_report_path.exists():
         print(f"[ERROR] Re-judge did not produce {rerun_judge_report_path}")
         sys.exit(1)
 
     print(f"[INFO] Re-judge complete: {rerun_judge_report_path}")
 
-    # Parse re-judge results
+    # ---- 9. Copy judge outputs into original judge_output ----
+    print(f"\n[INFO] Copying re-judge outputs into {judge_output_dir} ...")
+    for sub in ["json", "vis"]:
+        src = judge_tmp_dir / sub
+        dst = judge_output_dir / sub
+        if src.exists():
+            n = sum(1 for _ in src.iterdir())
+            copy_dir_contents(src, dst)
+            print(f"  Copied {n} files: {sub}/")
+
+    # ---- 10. Parse re-judge results & update judge_report.json ----
     with open(rerun_judge_report_path, 'r') as f:
         rerun_judge_report = json.load(f)
 
-    passed_rerun_files = set()
     rerun_results = {}
     for img in rerun_judge_report.get("images", []):
         fname = img["file_name"]
-        status = img["overall_status"]
-        score = img["overall_score"]
         rerun_results[fname] = {
-            "status": status,
-            "score": score,
-            "json_path": img.get("json_path", ""),
+            "status": img.get("overall_status", "review"),
+            "score": img.get("overall_score", 0.0),
         }
-        if status == "pass":
-            passed_rerun_files.add(fname)
-        print(f"  [{status}] {fname} score={score:.4f}")
+        print(f"  [{rerun_results[fname]['status']}] {fname} score={rerun_results[fname]['score']:.4f}")
 
-    # Save rerun summary
-    rerun_report_path = rerun_dir / "rerun_report.json"
-    rerun_report = {
-        "summary": {
-            "total_rerun": len(rerun_results),
-            "pass_after_rerun": len(passed_rerun_files),
-            "still_fail_or_review": len(rerun_results) - len(passed_rerun_files),
-            "pass_threshold": args.pass_threshold,
-        },
-        "results": rerun_results,
-    }
-    rerun_report_path.write_text(json.dumps(rerun_report, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"\n[INFO] Rerun report: {rerun_report_path}")
+    updated_report = merge_judge_reports(report, rerun_judge_report)
+    args.judge_report.write_text(json.dumps(updated_report, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"[INFO] Updated judge report: {args.judge_report}")
 
-    # ---- 6. 合并 COCO ----
-    print(f"\n[INFO] 合并 COCO 真值...")
-
-    # Collect all passed files (original pass + rerun pass)
-    original_passed = set()
-    for img in report.get("images", []):
-        if img.get("overall_status") == "pass":
-            original_passed.add(img["file_name"])
-
-    all_passed = original_passed | passed_rerun_files
-    print(f"  Original pass: {len(original_passed)} images")
-    print(f"  Rerun pass: {len(passed_rerun_files)} images")
-    print(f"  Total pass: {len(all_passed)} images")
-
-    coco_all, coco_pass = merge_coco_jsons(args.coco_json, rerun_coco_path, all_passed)
-
-    all_path = rerun_dir / "instances_all.json"
-    pass_path = rerun_dir / "instances_pass_only.json"
-    all_path.write_text(json.dumps(coco_all, indent=2, ensure_ascii=False), encoding="utf-8")
-    pass_path.write_text(json.dumps(coco_pass, indent=2, ensure_ascii=False), encoding="utf-8")
+    # ---- 11. Write summary txt ----
+    write_summary_txt(output_dir, failed_images, rerun_results, args.coco_json, args.judge_report)
 
     print(f"\n{'='*60}")
-    print(f"[DONE] 再优化完成")
-    print(f"  全量真值 (含未通过): {all_path}")
-    print(f"  仅通过真值:          {pass_path}")
-    print(f"  重跑报告:            {rerun_report_path}")
+    print(f"[DONE] Rerun complete")
+    print(f"  SAM3 COCO:  {args.coco_json}")
+    print(f"  Judge report: {args.judge_report}")
+    print(f"  Summary txt: {output_dir / 'rerun_summary.txt'}")
     print(f"{'='*60}")
 
 
