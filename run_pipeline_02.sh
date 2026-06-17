@@ -167,18 +167,18 @@ else
         --output-dir "$SAM3_OUT_DIR" \
         --checkpoint "$SAM3_CHECKPOINT"
 
-    # Auto-detect Instance directories: Instance_* for multi-model, Instance for single
+    # Auto-detect Instance directories at maxdepth 2 under SAM3_OUT_DIR
+    # Covers: sam3_output/{sub}/Instance/ (multi-model)
+    #         sam3_output/{sub}/Instance_xxx/ (multi-model with prefix)
+    #         sam3_output/{FOLDER}/Instance/ (single-model)
+    #         sam3_output/{FOLDER}/Instance_xxx/ (single-model with prefix)
     INSTANCE_DIRS=()
-    BASE_INST="${SAM3_OUT_DIR}/${FOLDER_NAME}"
-    if [ -d "$BASE_INST" ]; then
-        while IFS= read -r -d '' d; do
-            INSTANCE_DIRS+=("$d")
-        done < <(find "$BASE_INST" -maxdepth 1 -type d -name "Instance_*" -print0 2>/dev/null | sort -z)
-    fi
-
-    if [ ${#INSTANCE_DIRS[@]} -eq 0 ] && [ -d "${BASE_INST}/Instance" ]; then
-        INSTANCE_DIRS=("${BASE_INST}/Instance")
-    fi
+    while IFS= read -r -d '' d; do
+        INSTANCE_DIRS+=("$d")
+    done < <(find "$SAM3_OUT_DIR" -maxdepth 3 -type d -name "Instance" -print0 2>/dev/null | sort -z)
+    while IFS= read -r -d '' d; do
+        INSTANCE_DIRS+=("$d")
+    done < <(find "$SAM3_OUT_DIR" -maxdepth 3 -type d -name "Instance_*" -print0 2>/dev/null | sort -z)
 
     if [ ${#INSTANCE_DIRS[@]} -eq 0 ]; then
         echo "[ERROR] SAM3 未生成任何 Instance/ 目录"
@@ -200,13 +200,32 @@ for INST_DIR in "${INSTANCE_DIRS[@]}"; do
     fi
 
     # 确定该 Instance 对应的图片目录和输出子目录
+    # Multi-model: INST_DIR = sam3_output/{sub_name}/Instance/
+    # Single-model Instance_*: INST_DIR = sam3_output/{FOLDER_NAME}/Instance_xxx/
+    # Single-model Instance: INST_DIR = sam3_output/{FOLDER_NAME}/Instance/
     if [[ "$INST_NAME" == Instance_* ]]; then
         SUB_NAME="${INST_NAME#Instance_}"
         SUB_IMG_DIR="${INPUT_DIR}/production_data/${SUB_NAME}"
         SUB_JUDGE_OUT="${JUDGE_OUT_DIR}/${SUB_NAME}"
+    elif [ "$INST_NAME" = "Instance" ]; then
+        PARENT_NAME="$(basename "$(dirname "$INST_DIR")")"
+        if [ "$PARENT_NAME" != "$FOLDER_NAME" ]; then
+            # Multi-model: parent is sub-material name
+            SUB_NAME="$PARENT_NAME"
+            SUB_IMG_DIR="${INPUT_DIR}/production_data/${SUB_NAME}"
+            SUB_JUDGE_OUT="${JUDGE_OUT_DIR}/${SUB_NAME}"
+        else
+            # Single-model: parent is FOLDER_NAME
+            SUB_NAME="${FOLDER_NAME}"
+            if [ -d "${INPUT_DIR}/production_data" ]; then
+                SUB_IMG_DIR="${INPUT_DIR}/production_data"
+            else
+                SUB_IMG_DIR="${INPUT_DIR}"
+            fi
+            SUB_JUDGE_OUT="${JUDGE_OUT_DIR}"
+        fi
     else
         SUB_NAME="${FOLDER_NAME}"
-        # YOLO 单模型: 优先 production_data/, 否则用 input_dir
         if [ -d "${INPUT_DIR}/production_data" ]; then
             SUB_IMG_DIR="${INPUT_DIR}/production_data"
         else
