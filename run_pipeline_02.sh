@@ -7,6 +7,9 @@ set -euo pipefail
 # v2 新增: Step 4 — 对 fail/review 图片用 Qwen 分析 YOLO box 内容,
 #          SAM3 混合提示 (box+text) 重分割, 重新 judge, 合并真值
 #
+# v2.1: 支持 model/ + production_data/ 多模型布局,
+#       自动按名称匹配, 每个子物料独立 Instance_<name>/ 输出
+#
 # 用法:
 #   bash run_pipeline_02.sh <input_dir> [output_dir]
 #
@@ -44,6 +47,7 @@ if [ -n "$GPU_DEVICE" ]; then
 fi
 
 # ---- Step 0: 探测模式 ----
+MULTI_MODEL=0
 if [ -d "${INPUT_DIR}/dataset" ]; then
     MODE="dataset"
     SPLITS="train valid test"
@@ -51,7 +55,6 @@ if [ -d "${INPUT_DIR}/dataset" ]; then
 else
     MODE="yolo"
     PT_FILES=()
-    PT_FOUND=""
     while IFS= read -r -d '' f; do
         PT_FILES+=("$f")
     done < <(find "${INPUT_DIR}" -maxdepth 3 -name "*.pt" -type f -print0 2>/dev/null || true)
@@ -73,9 +76,9 @@ else
     if [ "$BEST_PT_COUNT" -eq 1 ]; then
         PT_FOUND="$BEST_PT"
     elif [ "$BEST_PT_COUNT" -gt 1 ]; then
-        echo "[ERROR] 发现 ${BEST_PT_COUNT} 个 best.pt 文件"
+        echo "[INFO] 发现 ${BEST_PT_COUNT} 个 best.pt，交由 batch_01.py model/production_data 自动匹配"
         for f in "${PT_FILES[@]}"; do echo "  $f"; done
-        exit 1
+        MULTI_MODEL=1
     elif [ "${#PT_FILES[@]}" -eq 1 ]; then
         PT_FOUND="${PT_FILES[0]}"
     else
@@ -96,7 +99,11 @@ echo "  Input:      ${INPUT_DIR}"
 echo "  Output:     ${OUTPUT_DIR}"
 echo "  GPU:        ${GPU_DEVICE:-all}"
 if [ "$MODE" = "yolo" ]; then
-    echo "  YOLO model: ${PT_FOUND}"
+    if [ "$MULTI_MODEL" -eq 1 ]; then
+        echo "  YOLO:       multi-model (batch_01.py auto-match)"
+    else
+        echo "  YOLO model: ${PT_FOUND:-auto}"
+    fi
 fi
 echo "============================================================"
 
@@ -153,84 +160,120 @@ out.write_text(json.dumps(merged, indent=2), encoding='utf-8')
 print(f'合并完成: {out} ({len(merged[\"images\"])} images, {len(merged[\"annotations\"])} annots)')
 "
 
-    COCO_JSON="${MERGED_DIR}/instances_default.json"
+    INSTANCE_DIRS=("$MERGED_DIR")
 else
     python /home/model/work/sam3_facebook/batch_01.py \
         --dataset-root "$INPUT_DIR" \
         --output-dir "$SAM3_OUT_DIR" \
         --checkpoint "$SAM3_CHECKPOINT"
 
-    COCO_JSON="${SAM3_OUT_DIR}/${FOLDER_NAME}/Instance/instances_default.json"
-fi
-
-if [ ! -f "$COCO_JSON" ]; then
-    echo "[ERROR] SAM3 未生成 COCO JSON: $COCO_JSON"
-    exit 1
-fi
-echo "[Step 1/4] 完成: $COCO_JSON"
-
-# ---- Step 2: Qwen-VL 质检 ----
-echo ""
-echo "[Step 2/4] Qwen-VL 质检..."
-conda activate "$JUDGE_CONDA_ENV"
-
-if [ "$MODE" = "yolo" ]; then
-    JUDGE_IMAGE_DIR="${INPUT_DIR}/production_data"
-    if [ ! -d "$JUDGE_IMAGE_DIR" ]; then
-        JUDGE_IMAGE_DIR="$INPUT_DIR"
+    # Auto-detect Instance directories: Instance_* for multi-model, Instance for single
+    INSTANCE_DIRS=()
+    BASE_INST="${SAM3_OUT_DIR}/${FOLDER_NAME}"
+    if [ -d "$BASE_INST" ]; then
+        while IFS= read -r -d '' d; do
+            INSTANCE_DIRS+=("$d")
+        done < <(find "$BASE_INST" -maxdepth 1 -type d -name "Instance_*" -print0 2>/dev/null | sort -z)
     fi
+
+    if [ ${#INSTANCE_DIRS[@]} -eq 0 ] && [ -d "${BASE_INST}/Instance" ]; then
+        INSTANCE_DIRS=("${BASE_INST}/Instance")
+    fi
+
+    if [ ${#INSTANCE_DIRS[@]} -eq 0 ]; then
+        echo "[ERROR] SAM3 未生成任何 Instance/ 目录"
+        exit 1
+    fi
+
+    echo "[Step 1/4] 发现 ${#INSTANCE_DIRS[@]} 个 Instance 目录:"
+    for d in "${INSTANCE_DIRS[@]}"; do echo "  - $(basename "$d")"; done
 fi
 
-python /home/model/work/llm/judge_01.py \
-    --images-dir "$JUDGE_IMAGE_DIR" \
-    --coco-json "$COCO_JSON" \
-    --output-dir "$JUDGE_OUT_DIR" \
-    --model-path "$JUDGE_MODEL_PATH" \
-    --max-images "$MAX_IMAGES" \
-    --pass-threshold "$JUDGE_PASS_THRESHOLD"
+# ---- Step 2-4: 对每个 Instance 循环执行 Judge → Report → Rerun ----
+for INST_DIR in "${INSTANCE_DIRS[@]}"; do
+    INST_NAME="$(basename "$INST_DIR")"
+    SUB_COCO="${INST_DIR}/instances_default.json"
 
-JUDGE_REPORT="${JUDGE_OUT_DIR}/judge_report.json"
-if [ ! -f "$JUDGE_REPORT" ]; then
-    echo "[ERROR] judge 未生成报告: $JUDGE_REPORT"
-    exit 1
-fi
-echo "[Step 2/4] 完成: $JUDGE_REPORT"
+    if [ ! -f "$SUB_COCO" ]; then
+        echo "[WARN] 跳过 ${INST_NAME}: instances_default.json 不存在"
+        continue
+    fi
 
-# ---- Step 3: 结果汇总 ----
-echo ""
-echo "[Step 3/4] 结果汇总..."
-python /home/model/work/llm/check_report_01.py "$JUDGE_REPORT"
+    # 确定该 Instance 对应的图片目录和输出子目录
+    if [[ "$INST_NAME" == Instance_* ]]; then
+        SUB_NAME="${INST_NAME#Instance_}"
+        SUB_IMG_DIR="${INPUT_DIR}/production_data/${SUB_NAME}"
+        SUB_JUDGE_OUT="${JUDGE_OUT_DIR}/${SUB_NAME}"
+    else
+        SUB_NAME="${FOLDER_NAME}"
+        # YOLO 单模型: 优先 production_data/, 否则用 input_dir
+        if [ -d "${INPUT_DIR}/production_data" ]; then
+            SUB_IMG_DIR="${INPUT_DIR}/production_data"
+        else
+            SUB_IMG_DIR="${INPUT_DIR}"
+        fi
+        SUB_JUDGE_OUT="${JUDGE_OUT_DIR}"
+    fi
 
-# ---- Step 4: 失败图片再优化 (Qwen描述 + SAM3混合提示 + 重新评判 + COCO合并) ----
-if [ "$SKIP_RERUN" = "1" ]; then
     echo ""
-    echo "[Step 4/4] SKIP (SKIP_RERUN=1)"
-else
+    echo "------------------------------------------------------------"
+    echo "  处理 Instance: ${INST_NAME} (${SUB_NAME})"
+    echo "  COCO:   ${SUB_COCO}"
+    echo "  Images: ${SUB_IMG_DIR}"
+    echo "  Judge:  ${SUB_JUDGE_OUT}"
+    echo "------------------------------------------------------------"
+
+    # ---- Step 2: Qwen-VL 质检 ----
     echo ""
-    echo "[Step 4/4] 失败图片再优化..."
-    # 确保在 vllm_new 环境中运行 (Qwen 模型)
+    echo "[Step 2/4] Qwen-VL 质检 (${SUB_NAME})..."
     conda activate "$JUDGE_CONDA_ENV"
 
-    python /home/model/work/llm/rerun_optimize.py \
-        --judge-report "$JUDGE_REPORT" \
-        --coco-json "$COCO_JSON" \
-        --images-dir "$JUDGE_IMAGE_DIR" \
-        --output-dir "$OUTPUT_DIR" \
+    python /home/model/work/llm/judge_01.py \
+        --images-dir "$SUB_IMG_DIR" \
+        --coco-json "$SUB_COCO" \
+        --output-dir "$SUB_JUDGE_OUT" \
         --model-path "$JUDGE_MODEL_PATH" \
-        --sam3-checkpoint "$SAM3_CHECKPOINT" \
-        --sam3-conda-env "$SAM3_CONDA_ENV" \
+        --max-images "$MAX_IMAGES" \
         --pass-threshold "$JUDGE_PASS_THRESHOLD"
 
-    echo "[Step 4/4] 再优化完成"
-    echo "  全量真值: ${OUTPUT_DIR}/rerun/instances_all.json"
-    echo "  仅通过真值: ${OUTPUT_DIR}/rerun/instances_pass_only.json"
-    echo "  重跑报告: ${OUTPUT_DIR}/rerun/rerun_report.json"
-fi
+    JUDGE_REPORT="${SUB_JUDGE_OUT}/judge_report.json"
+    if [ ! -f "$JUDGE_REPORT" ]; then
+        echo "[ERROR] judge 未生成报告: $JUDGE_REPORT"
+        continue
+    fi
+    echo "[Step 2/4] 完成: $JUDGE_REPORT"
+
+    # ---- Step 3: 结果汇总 ----
+    echo ""
+    echo "[Step 3/4] 结果汇总 (${SUB_NAME})..."
+    python /home/model/work/llm/check_report_01.py "$JUDGE_REPORT"
+
+    # ---- Step 4: 失败图片再优化 ----
+    if [ "$SKIP_RERUN" = "1" ]; then
+        echo ""
+        echo "[Step 4/4] SKIP (SKIP_RERUN=1)"
+    else
+        echo ""
+        echo "[Step 4/4] 失败图片再优化 (${SUB_NAME})..."
+        conda activate "$JUDGE_CONDA_ENV"
+
+        python /home/model/work/llm/rerun_optimize.py \
+            --judge-report "$JUDGE_REPORT" \
+            --coco-json "$SUB_COCO" \
+            --images-dir "$SUB_IMG_DIR" \
+            --output-dir "$OUTPUT_DIR" \
+            --model-path "$JUDGE_MODEL_PATH" \
+            --sam3-checkpoint "$SAM3_CHECKPOINT" \
+            --sam3-conda-env "$SAM3_CONDA_ENV" \
+            --pass-threshold "$JUDGE_PASS_THRESHOLD"
+
+        echo "[Step 4/4] 再优化完成"
+    fi
+done
 
 echo ""
 echo "============================================================"
 echo "  Pipeline v2 完成: ${FOLDER_NAME}"
 echo "  SAM3 output:  ${SAM3_OUT_DIR}"
 echo "  Judge output: ${JUDGE_OUT_DIR}"
-echo "  Rerun output: ${OUTPUT_DIR}/rerun/"
 echo "============================================================"
