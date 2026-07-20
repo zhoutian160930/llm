@@ -123,44 +123,17 @@ if [ "$MODE" = "dataset" ]; then
         --output-dir "$SAM3_OUT_DIR" \
         --checkpoint "$SAM3_CHECKPOINT"
 
-    MERGED_DIR="${SAM3_OUT_DIR}/${FOLDER_NAME}/Instance"
-    mkdir -p "$MERGED_DIR"
-
-    python -c "
-import json
-from pathlib import Path
-
-merged = {'images': [], 'annotations': [], 'categories': []}
-img_offset = 1
-ann_offset = 1
-
-for split in ['train', 'valid', 'test']:
-    p = Path('${SAM3_OUT_DIR}/${FOLDER_NAME}') / split / 'Instance' / f'instances_{split}.json'
-    if not p.exists():
-        continue
-    d = json.loads(p.read_text())
-    id_map = {}
-    for img in d.get('images', []):
-        new_id = img_offset
-        id_map[img['id']] = new_id
-        img['id'] = new_id
-        img_offset += 1
-        merged['images'].append(img)
-    for ann in d.get('annotations', []):
-        ann['id'] = ann_offset
-        ann['image_id'] = id_map.get(ann['image_id'], ann['image_id'])
-        ann_offset += 1
-        merged['annotations'].append(ann)
-    for cat in d.get('categories', []):
-        if not any(c['id'] == cat['id'] for c in merged['categories']):
-            merged['categories'].append(cat)
-
-out = Path('${MERGED_DIR}/instances_default.json')
-out.write_text(json.dumps(merged, indent=2), encoding='utf-8')
-print(f'合并完成: {out} ({len(merged[\"images\"])} images, {len(merged[\"annotations\"])} annots)')
-"
-
-    INSTANCE_DIRS=("$MERGED_DIR")
+    # 把各 split 的 Instance/ 重命名为 Instance_{split}/
+    INSTANCE_DIRS=()
+    for split in $SPLITS; do
+        src="${SAM3_OUT_DIR}/${FOLDER_NAME}/${split}/Instance"
+        dst="${SAM3_OUT_DIR}/${FOLDER_NAME}/Instance_${split}"
+        if [ -d "$src" ] && [ -f "${src}/instances_${split}.json" ]; then
+            mv "$src" "$dst"
+            INSTANCE_DIRS+=("$dst")
+            echo "  生成: Instance_${split}/"
+        fi
+    done
 else
     python /home/model/work/sam3_facebook/batch_01.py \
         --dataset-root "$INPUT_DIR" \
@@ -192,10 +165,10 @@ fi
 # ---- Step 2-4: 对每个 Instance 循环执行 Judge → Report → Rerun ----
 for INST_DIR in "${INSTANCE_DIRS[@]}"; do
     INST_NAME="$(basename "$INST_DIR")"
-    SUB_COCO="${INST_DIR}/instances_default.json"
+    SUB_COCO=$(find "${INST_DIR}" -maxdepth 1 -name "instances_*.json" -type f | head -1)
 
-    if [ ! -f "$SUB_COCO" ]; then
-        echo "[WARN] 跳过 ${INST_NAME}: instances_default.json 不存在"
+    if [ -z "$SUB_COCO" ] || [ ! -f "$SUB_COCO" ]; then
+        echo "[WARN] 跳过 ${INST_NAME}: 未找到 instances_*.json"
         continue
     fi
 
@@ -205,7 +178,11 @@ for INST_DIR in "${INSTANCE_DIRS[@]}"; do
     # Single-model Instance: INST_DIR = sam3_output/{FOLDER_NAME}/Instance/
     if [[ "$INST_NAME" == Instance_* ]]; then
         SUB_NAME="${INST_NAME#Instance_}"
-        SUB_IMG_DIR="${INPUT_DIR}/production_data/${SUB_NAME}"
+        if [ "$MODE" = "dataset" ]; then
+            SUB_IMG_DIR="${INPUT_DIR}/dataset/${SUB_NAME}/images"
+        else
+            SUB_IMG_DIR="${INPUT_DIR}/production_data/${SUB_NAME}"
+        fi
         SUB_JUDGE_OUT="${JUDGE_OUT_DIR}/${SUB_NAME}"
     elif [ "$INST_NAME" = "Instance" ]; then
         PARENT_NAME="$(basename "$(dirname "$INST_DIR")")"
